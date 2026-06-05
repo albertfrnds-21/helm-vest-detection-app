@@ -11,6 +11,15 @@ from datetime import datetime
 import base64
 from io import BytesIO
 
+# WebRTC for real-time streaming (works on hosting!)
+try:
+    from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
+    import av
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
+    print("streamlit-webrtc not available. Install with: pip install streamlit-webrtc av")
+
 # =====================================================
 # SUPABASE INTEGRATION
 # =====================================================
@@ -659,6 +668,68 @@ with st.sidebar:
     st.caption("© 2026 Proyek Akhir Informatika\nArea Dermaga — Keselamatan Kerja")
 
 # =====================================================
+# WEBRTC VIDEO TRANSFORMER (for real-time streaming)
+# =====================================================
+if WEBRTC_AVAILABLE:
+    class PPEVideoTransformer(VideoTransformerBase):
+        """
+        Video transformer untuk deteksi PPE real-time via WebRTC
+        Bekerja di hosting karena menggunakan browser WebRTC API
+        """
+        def __init__(self):
+            self.conf_helmet = 0.30
+            self.conf_vest = 0.10
+            self.conf_head = 0.35
+            self.conf_person = 0.20
+            self.iou_thresh = 0.45
+            self.frame_count = 0
+            self.last_detection = {"safe": 0, "warning": 0, "danger": 0, "total": 0, "status": ""}
+        
+        def transform(self, frame):
+            """
+            Transform setiap frame dari webcam
+            Input: av.VideoFrame
+            Output: np.ndarray (processed frame)
+            """
+            # Convert av.VideoFrame to numpy array
+            img = frame.to_ndarray(format="bgr24")
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Run detection (setiap 3 frame untuk performa)
+            self.frame_count += 1
+            if self.frame_count % 3 == 0:
+                try:
+                    detections, area_status, counts, total = run_detection(
+                        img_rgb, 
+                        self.conf_helmet, 
+                        self.conf_vest, 
+                        self.conf_head, 
+                        self.conf_person, 
+                        self.iou_thresh
+                    )
+                    
+                    # Render boxes
+                    img_rgb = render_boxes(img_rgb, detections)
+                    
+                    # Save detection untuk stats
+                    self.last_detection = {
+                        "safe": counts["safe"],
+                        "warning": counts["warning"],
+                        "danger": counts["danger"],
+                        "total": total,
+                        "status": area_status
+                    }
+                except Exception as e:
+                    print(f"Detection error: {e}")
+            
+            # Convert back to BGR for display
+            return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        
+        def get_last_detection(self):
+            """Get stats dari deteksi terakhir"""
+            return self.last_detection
+
+# =====================================================
 # MODEL LOAD
 # =====================================================
 @st.cache_resource(show_spinner=False)
@@ -1293,82 +1364,39 @@ elif st.session_state.app_mode == "video":
         render_session_chart()
 
 # =====================================================
-# MODE: REALTIME WEBCAM (browser-based camera input)
+# MODE: REALTIME WEBCAM (continuous frame prediction)
 # =====================================================
 elif st.session_state.app_mode == "realtime":
     st.markdown("""
     <div class="rt-info">
-        📹 <b>Mode Kamera Realtime</b> — Ambil foto dari webcam untuk deteksi instant.
-        Kamera menggunakan browser webcam (berfungsi di local & hosting).
+        📹 <b>Mode Kamera Realtime</b> - Deteksi berjalan otomatis setiap frame dari webcam.
+        Kamera langsung memproses tanpa perlu menekan tombol. Klik <b>Stop</b> untuk menghentikan.
     </div>
     """, unsafe_allow_html=True)
+
+    run_cam = st.toggle("▶ Aktifkan Kamera Realtime", value=True, key="cam_toggle")
 
     # Layout untuk kamera dan stats
     col_cam, col_cam_stats = st.columns([3, 2], gap="medium")
     
     with col_cam:
-        st.markdown('<div class="section-title">📹 Camera Input</div>', unsafe_allow_html=True)
-        
-        # Browser-based camera input (works on hosting!)
-        camera_photo = st.camera_input("Ambil foto dari webcam", key="camera_input")
-        
-        if camera_photo is not None:
-            # Convert to numpy array
-            image = Image.open(camera_photo).convert("RGB")
-            img_np = np.array(image)
-            
-            # Run detection
-            with st.spinner("🕵️ Menganalisis gambar dari kamera..."):
-                dets, area_s, cnts, tot = run_detection(
-                    img_np, conf_helmet, conf_vest, conf_head, conf_person, iou_thresh)
-                ann = render_boxes(img_np, dets)
-                log_detection("webcam", cnts, tot, area_s)
-            
-            # Show result
-            st.markdown('<div class="img-frame"><div class="img-frame-label">🤖 Hasil Deteksi</div>', unsafe_allow_html=True)
-            st.image(ann, channels="RGB", use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Update stats
-            with col_cam_stats:
-                st.markdown('<div class="section-title">📊 Live Metrik</div>', unsafe_allow_html=True)
-                show_metrics(cnts, tot)
-                show_status_banner(area_s)
-
-    # Alternative: Continuous capture mode (local only)
-    st.markdown("---")
-    st.markdown('<div class="section-title">🔄 Mode Continuous (Local Only)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">📹 Live Feed Deteksi</div>', unsafe_allow_html=True)
+        frame_placeholder = st.empty()
+        fps_placeholder   = st.empty()
     
-    with st.expander("ℹ️ Klik untuk info Mode Continuous", expanded=False):
-        st.info("""
-        **Mode Continuous** menggunakan `cv2.VideoCapture(0)` yang hanya berfungsi di komputer lokal.
-        
-        **Tidak berfungsi di hosting** karena:
-        - Server tidak punya akses ke webcam fisik
-        - Browser tidak bisa share webcam stream ke backend Python
-        - OpenCV hanya bisa akses kamera lokal
-        
-        **Gunakan mode Camera Input di atas** jika aplikasi di-hosting!
-        """)
-    
-    run_continuous = st.toggle("▶ Aktifkan Continuous Mode (Local Only)", value=False, key="cam_continuous_toggle")
+    with col_cam_stats:
+        st.markdown('<div class="section-title">📊 Live Metrik</div>', unsafe_allow_html=True)
+        # 1 container saja untuk semua stats
+        rt_stats_container = st.empty()
 
-    if run_continuous:
-        st.warning("⚠️ Mode ini hanya bekerja di local. Di hosting, gunakan Camera Input di atas.")
-        
+    if run_cam:
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             st.error("❌ Kamera tidak ditemukan. Pastikan webcam tersambung dan izin diberikan.")
-            st.info("💡 **Jika di hosting:** Mode ini tidak akan bekerja. Gunakan Camera Input di atas!")
         else:
-            frame_placeholder = st.empty()
-            fps_placeholder = st.empty()
-            stats_container = st.empty()
-            
-            stop_btn = st.button("⏹ Stop", key="stop_continuous")
             prev_time = time.time()
 
-            while not stop_btn and st.session_state.get("cam_continuous_toggle", False):
+            while st.session_state.get("cam_toggle", True):
                 ret, frame = cap.read()
                 if not ret:
                     st.warning("⚠️ Gagal membaca frame dari kamera.")
@@ -1389,16 +1417,15 @@ elif st.session_state.app_mode == "realtime":
                 frame_placeholder.image(ann, channels="RGB", use_container_width=True)
                 fps_placeholder.caption(f"⚡ FPS: {fps_val:.1f}  |  Frame terakhir: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
 
-                # Update stats
-                with stats_container.container():
+                # Update stats dalam 1 container (lebih simple)
+                with rt_stats_container.container():
                     show_metrics(cnts, tot)
                     show_status_banner(area_s)
 
             cap.release()
-            st.info("✅ Kamera dihentikan.")
+            st.info("Kamera dihentikan.")
 
     # Log & chart below
-    st.markdown("---")
     st.markdown('<div class="section-title">📋 Log Deteksi Sesi</div>', unsafe_allow_html=True)
     col_log, col_trend = st.columns([1,1], gap="medium")
     with col_log:
